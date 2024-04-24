@@ -1,70 +1,98 @@
-import argparse
-import asyncio
 import os
+
+import urllib3
+import json
 import hashlib
-from garmin_sync import Garmin, download_new_activities, gather_with_concurrency
-from synced_data_file_logger import load_synced_activity_list, save_synced_activity_list
-from coros_sync import Coros
 
-# 设置TCX文件夹路径
-TCX_FOLDER = "path/to/tcx/folder"
+from coros.entity.login_user import LoginUser
 
-# 确保TCX文件夹存在
-if not os.path.exists(TCX_FOLDER):
-    os.mkdir(TCX_FOLDER)
 
-# 同步佳明国际区到TCX
-async def sync_garmin_international(secret_string_global):
-    # 加载已同步的活动列表
-    synced_activity = load_synced_activity_list()
 
-    # 下载新的活动
-    future = asyncio.ensure_future(
-        download_new_activities(
-            secret_string_global,
-            "Global",  # 只需关注国际区
-            synced_activity,
-            False,  # 是否只运行，不同步
-            TCX_FOLDER,
-            "tcx",  # 使用TCX格式
-        )
-    )
-    await future
+class CorosClient:
+    
+    def __init__(self, email, password) -> None:
+        
+        self.email = email
+        self.password = password
+        self.req = urllib3.PoolManager()
+        self.accessToken = None
+        self.userId = None
+    
+    ## 登录接口
+    def login(self):
+        
+        login_url = "https://teamcnapi.coros.com/account/login"
 
-    new_ids = future.result()
+        login_data = {
+            "account": self.email,
+            "pwd": hashlib.md5(self.password.encode()).hexdigest(), ##MD5加密密码
+            "accountType":2,
+        }
+        headers = {
+          "Accept":       "application/json, text/plain, */*",
+          "Content-Type": "application/json;charset=UTF-8",
+          "User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.39 Safari/537.36",
+          "referer": "https://trainingcn.coros.com/",
+          "origin": "https://trainingcn.coros.com/",
+        }
 
-    # 保存新同步的活动
-    synced_activity.extend(new_ids)
-    save_synced_activity_list(synced_activity)
+        login_body = json.dumps(login_data)
+        response = self.req.request('POST', login_url, body=login_body, headers=headers)
 
-    return new_ids
+        login_response = json.loads(response.data)
+        login_result = login_response["result"]
+        if login_result != "0000":
+            raise CorosLoginError("高驰登录异常，异常原因为：" + login_response["message"])
 
-# 上传TCX到高驰
-async def upload_tcx_to_coros(coros_account, coros_password):
-    coros = Coros(coros_account, hashlib.md5(coros_password.encode()).hexdigest())
-    await coros.init()
+        accessToken = login_response["data"]["accessToken"]
+        userId =  login_response["data"]["userId"]
+        self.accessToken = accessToken
+        self.userId = userId
 
-    # 上传所有TCX文件
-    tcx_files = [os.path.join(TCX_FOLDER, f) for f in os.listdir(TCX_FOLDER) if f.endswith(".tcx")]
+    ## 上传运动
+    def uploadActivity(self, file_path):
+        ## 判断Token 是否为空
+        if self.accessToken == None:
+            self.login()
 
-    await gather_with_concurrency(
-        10,
-        [coros.upload_activity(file) for file in tcx_files]
-    )
+        upload_url = "https://teamcnapi.coros.com/activity/fit/import"
 
-# 主程序，执行同步和上传
-async def main(secret_string_global, coros_account, coros_password):
-    # 第一步：同步佳明国际区的TCX数据
-    new_ids = await sync_garmin_international(secret_string_global)
+        headers = {
+          "Accept":       "application/json, text/plain, */*",
+          "User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.39 Safari/537.36",
+          "referer": "https://trainingcn.coros.com/",
+          "origin": "https://trainingcn.coros.com/",
+          "accesstoken": self.accessToken,
+        }
+     
+        with open(file_path, 'rb') as f:
+            file_data = f.read() 
+        try:
+          response = self.req.request(
+              method = 'POST',
+              url=upload_url,
+              fields={'sportData': (os.path.basename(file_path), file_data), "jsonParameter": """{"source":1,"timezone":32}"""},
+              headers=headers
+          )
+          upload_response = json.loads(response.data)
+          upload_result = upload_response["result"]
+          return upload_result
+        except Exception as err:
+            exit()
 
-    # 第二步：上传TCX到高驰
-    await upload_tcx_to_coros(coros_account, coros_password)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("global_secret_string", help="佳明国际区的认证字符串")
-    parser.add_argument("coros_account", help="高驰的账户")
-    parser.add_argument("coros_password", help="高驰的密码")
-    options = parser.parse_args()
 
-    asyncio.run(main(options.global_secret_string, options.coros_account, options.coros_password))
+
+class CorosLoginError(Exception):
+
+    def __init__(self, status):
+        """Initialize."""
+        super(CorosLoginError, self).__init__(status)
+        self.status = status
+
+class CorosActivityUploadError(Exception):
+
+    def __init__(self, status):
+        """Initialize."""
+        super(CorosActivityUploadError, self).__init__(status)
+        self.status = status
